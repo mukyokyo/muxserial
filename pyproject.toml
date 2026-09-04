@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muxserial"
+version = "0.1.0"
+authors = [
+  { name="mukyokyo" }
+]
+description = "Transparent serial port multiplexer."
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Terminals :: Serial",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "pyserial>=3.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/mukyokyo/muxserial"
