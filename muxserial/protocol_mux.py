@@ -72,6 +72,8 @@ class Serial(SerialBase):
     self._wlock = threading.Lock()
     self._suspended = False
     self._lost = False
+    if not hasattr(self, '_release_immediate'):
+      self._release_immediate = False
 
     try:
       self._sock = socket.create_connection((host, int(port)), timeout=5.0)
@@ -94,7 +96,7 @@ class Serial(SerialBase):
       raise
     self._reconfigure_port()
 
-  def close(self):
+  def close(self, immediate=None):
     if not self.is_open:
       return
     self.is_open = False
@@ -111,7 +113,37 @@ class Serial(SerialBase):
     with self._evcv:
       self._evcv.notify_all()
     if getattr(self, '_device', None) is not None:
-      manager.release(self._device)
+      if immediate is None:
+        immediate = getattr(self, '_release_immediate', False)
+      manager.release(self._device, immediate=immediate)
+
+  def close_now(self, wait=1.0):
+    """Close and do not let the broker linger on the physical port.
+
+    Returns True when the OS handle is confirmed released. Use before handing
+    the device to a program that must own it.
+    """
+    device = getattr(self, '_device', None)
+    self.close(immediate=True)
+    if device is None:
+      return True
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+      # owner_of() ではなく is_local()。前者は他プロセスを探しにソケットを
+      # 叩くので、待ちの中で回すと probe のタイムアウトぶん余計に待たされる
+      if not manager.is_local(device):
+        return True
+      time.sleep(0.005)
+    return not manager.is_local(device)
+
+  @property
+  def release_immediate(self):
+    """When true, close() hands the physical port back without lingering."""
+    return getattr(self, '_release_immediate', False)
+
+  @release_immediate.setter
+  def release_immediate(self, flag):
+    self._release_immediate = bool(flag)
 
   @property
   def device(self):
@@ -161,6 +193,12 @@ class Serial(SerialBase):
       # exactly as it would on a native unplug.
       self._fail('device removed: %s' % msg.get('msg', ''))
       return
+    elif ev == 'device_reset':
+      # ブローカがハンドルを取り直しただけ。セッションは続いているので
+      # read() を例外で起こさない。取りこぼしはあり得るので手元は捨てる
+      self._lost = False
+      with self._cv:
+        del self._rx[:]
     elif ev == 'device_found':
       self._lost = False
       if msg.get('error'):

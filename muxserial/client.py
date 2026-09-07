@@ -111,11 +111,26 @@ class SerialPort(object):
         % (native_err, self._last_mux_error))
     self._url, self._is_mux = native, False
 
-  def close(self):
+  def close(self, immediate=False):
+    """Close the port. immediate=True also releases the physical handle now."""
     try:
+      if immediate:
+        fn = getattr(self._ser, 'close_now', None)
+        if fn is not None:
+          return fn()
       self._ser.close()
     except Exception:
       pass
+    return True
+
+  @property
+  def release_immediate(self):
+    return getattr(self._ser, 'release_immediate', True)
+
+  @release_immediate.setter
+  def release_immediate(self, flag):
+    if hasattr(type(self._ser), 'release_immediate'):
+      self._ser.release_immediate = bool(flag)
 
   def __enter__(self):
     if not self._ser.is_open:
@@ -125,6 +140,49 @@ class SerialPort(object):
   def __exit__(self, *exc):
     self.close()
     return False
+
+  def hand_over(self, wait_back=20.0, settle=0.5, reopen=True):
+    """Release the port for an external tool, then wait for the board to return.
+
+    For arduino-cli, avrdude, dfu-util and friends: they need the OS handle to
+    themselves, and the board resets when they are done. On a native-USB board
+    the port that comes back is a different device with the same name, so
+    simply reopening at once lands on a handle that never delivers anything.
+
+        real = port.device
+        port.hand_over_begin()
+        subprocess.run(['arduino-cli', 'upload', '-p', real, ...])
+        port.hand_over(wait_back=20)
+
+    Returns True when the port is back and open again.
+    """
+    dev = self.device
+    ok = presence.wait_recycle(dev, timeout=wait_back, settle=settle)
+    manager.notify_device_change()
+    if not ok:
+      return False
+    if reopen:
+      self._ser = serial.serial_for_url(self._url, *self._args,
+                                        do_not_open=True, **self._kwargs)
+      self.open()
+    return True
+
+  def hand_over_begin(self, wait=2.0):
+    """Give the OS handle back and confirm it is gone. Pairs with hand_over()."""
+    return self.release_now(wait=wait)
+
+  def release_now(self, wait=2.0):
+    """Give the OS handle back and confirm it is gone.
+
+    detach() is the polite form (the broker keeps the session and other clients
+    stay attached). This is the blunt one, for when nothing may hold the device.
+    """
+    if not self._is_mux:
+      self.close()
+      return True
+    dev = self.device
+    self.close(immediate=True)
+    return manager.release_device(dev, timeout=wait)
 
   # ---------------------------------------------------------------- extras
 

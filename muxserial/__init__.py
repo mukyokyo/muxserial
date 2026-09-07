@@ -25,8 +25,10 @@ from .core import (MAGIC, T_DATA, T_CTRL, T_EVENT, FrameReader,
                    pack, pack_ctrl, pack_event, Broker, Server, serve)
 from . import manager, presence, registry
 from .manager import (shutdown, shutdown_all, active, set_verbose,
-                      is_available, notify_device_change, owner_of)
-from .presence import comports, normalize, raw_comports
+                      is_available, notify_device_change, owner_of, is_local,
+                      set_linger, release_device)
+from .presence import (comports, normalize, raw_comports, identity,
+                       wait_present, wait_recycle)
 
 if 'muxserial' not in _pyserial.protocol_handler_packages:
   _pyserial.protocol_handler_packages.append('muxserial')
@@ -53,6 +55,8 @@ def SerialPort(*args, **kwargs):
 
 
 __all__ = ['open', 'to_url', 'SerialPort', 'shutdown', 'shutdown_all', 'active',
-           'set_verbose', 'is_available', 'notify_device_change', 'owner_of',
-           'comports', 'raw_comports', 'normalize',
+           'set_verbose', 'is_available', 'notify_device_change', 'owner_of', 'is_local',
+           'set_linger', 'release_device',
+           'comports', 'raw_comports', 'normalize', 'identity',
+           'wait_present', 'wait_recycle',
            'Broker', 'Server', 'serve', 'manager', 'presence', 'registry']

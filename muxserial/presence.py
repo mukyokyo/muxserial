@@ -29,6 +29,7 @@ _enum_lock = threading.RLock()
 _lock = threading.RLock()
 _cache = None
 _cache_at = 0.0
+_ident = {}                 # 'COM9' -> hardware identity string
 _listeners = []
 _dirty = threading.Event()
 
@@ -55,6 +56,23 @@ def raw_comports():
     return list(_real())
 
 
+def _identity_of(info):
+  """A string that changes when the hardware behind a port name changes.
+
+  A native-USB board (Arduino UNO R4, RP2040, anything with a CDC in the MCU)
+  disappears and re-enumerates when it resets after a firmware upload. Windows
+  usually hands the new device the same COM number, so watching the name alone
+  cannot tell that the handle we are holding now refers to something that no
+  longer exists: opening keeps working and nothing ever arrives.
+  """
+  parts = []
+  for attr in ('hwid', 'serial_number', 'location', 'vid', 'pid'):
+    v = getattr(info, attr, None)
+    if v not in (None, ''):
+      parts.append('%s=%s' % (attr, v))
+  return '|'.join(parts) if parts else None
+
+
 def list_devices(force=False):
   """Names of the serial ports the OS currently reports."""
   global _cache, _cache_at
@@ -63,15 +81,26 @@ def list_devices(force=False):
     if not force and _cache is not None and (now - _cache_at) < _CACHE_TTL:
       return _cache
   try:
-    names = [normalize(p.device) for p in raw_comports()]
+    infos = raw_comports()
   except Exception:
     # If enumeration fails we must not conclude the device is gone.
     with _lock:
       return _cache if _cache is not None else None
+  names = [normalize(p.device) for p in infos]
+  idents = {normalize(p.device): _identity_of(p) for p in infos}
   with _lock:
     _cache = names
+    _ident.clear()
+    _ident.update(idents)
     _cache_at = time.monotonic()
     return names
+
+
+def identity(device, force=False):
+  """Hardware identity of the port, or None when unknown/absent."""
+  list_devices(force=force)
+  with _lock:
+    return _ident.get(normalize(device))
 
 
 def present(device, force=False):
@@ -134,3 +163,42 @@ def comports():
     p.device = 'mux://%s' % normalize(p.device)
     out.append(p)
   return out
+
+
+def wait_present(device, timeout=15.0, settle=0.3, poll=0.05):
+  """Block until the port exists and has stayed there for `settle` seconds.
+
+  A board that resets after an upload can enumerate more than once (bootloader,
+  then the sketch), so the first appearance is not necessarily the final one.
+  Returns the hardware identity, or None on timeout.
+  """
+  deadline = time.monotonic() + timeout
+  stable_since = None
+  while time.monotonic() < deadline:
+    if present(device, force=True):
+      if stable_since is None:
+        stable_since = time.monotonic()
+      elif (time.monotonic() - stable_since) >= settle:
+        return identity(device)
+    else:
+      stable_since = None
+    time.sleep(poll)
+  return None
+
+
+def wait_recycle(device, timeout=20.0, gone_timeout=5.0, settle=0.5):
+  """Wait for the device to disappear and come back.
+
+  Use after handing the port to an external flasher: the board resets, so the
+  port that returns is a different device even when the name is unchanged.
+  Returns True if a full cycle was observed (or the port simply became stable).
+  """
+  deadline = time.monotonic() + gone_timeout
+  saw_gone = False
+  while time.monotonic() < deadline:
+    if not present(device, force=True):
+      saw_gone = True
+      break
+    time.sleep(0.05)
+  remaining = timeout if saw_gone else min(timeout, 3.0)
+  return wait_present(device, timeout=remaining, settle=settle) is not None

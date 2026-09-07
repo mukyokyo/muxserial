@@ -124,7 +124,8 @@ class Broker:
       with self.lock:
         idle = self.detached or self.lost
       if idle:
-        time.sleep(0.02)
+        # stopで即座に抜けられるよう、素のsleepでは待たない
+        self.stop.wait(0.02)
         continue
       try:
         # 2026-09-03: [Tester] ここは意図的にロックしない。実測したところ、この
@@ -148,7 +149,9 @@ class Broker:
 
   def _modem_poll(self):
     while not self.stop.is_set():
-      time.sleep(0.1)
+      self.stop.wait(0.1)
+      if self.stop.is_set():
+        return
       with self.lock:
         if self.detached or self.lost or not self.clients:
           continue
@@ -196,6 +199,39 @@ class Broker:
     self.log('lost:', reason)
     self.broadcast(pack_event('device_lost', msg=reason), only=list(self.clients))
 
+  def recycle(self, reason='device re-enumerated'):
+    """Swap the OS handle for a fresh one without ending anybody's session.
+
+    A native-USB board that resets keeps its COM name but becomes a different
+    device; the handle we hold still opens and reads, and simply never delivers
+    anything. Reopening is the only cure, and it is not the client's fault, so
+    the clients stay attached and merely get told.
+    """
+    with self.cv:
+      if self.detached:
+        return None
+      err = None
+      try:
+        if getattr(self.ser, 'is_open', False):
+          self.ser.close()
+      except Exception:
+        pass
+      try:
+        self.ser.open()
+      except Exception as e:
+        err = str(e)
+      self._modem = None
+      if err is None:
+        self.lost = False
+      self.cv.notify_all()
+    self.log('recycled:', reason, err or 'ok')
+    if err is not None:
+      self.mark_lost(err)
+      return err
+    self.broadcast(pack_event('device_reset', msg=reason),
+                   only=list(self.clients))
+    return None
+
   def mark_found(self):
     """The device came back. Returns an error string, or None on success."""
     err = None
@@ -213,7 +249,7 @@ class Broker:
     self.broadcast(pack_event('device_found', error=err), only=list(self.clients))
     return err
 
-  def shutdown(self):
+  def shutdown(self, join_timeout=0.25):
     self.stop.set()
     with self.cv:
       clients = list(self.clients)
@@ -222,6 +258,13 @@ class Broker:
       self.cv.notify_all()
     for c in clients:
       c.close()
+    # 2026-09-07: 物理ハンドルを閉じる前に_pumpを抜けさせる。read()の最中に別
+    # スレッドからclose()すると、Windowsでは保留中のI/Oを巻き込んで解放が遅れる
+    # (最悪ハンドルが残って次のopenが弾かれる)。read()のtimeoutは0.05なので、
+    # ここでの待ちは実質1周分にしかならない
+    for t in self._threads:
+      if t is not threading.current_thread():
+        t.join(join_timeout)
     try:
       if getattr(self.ser, 'is_open', False):
         self.ser.close()
@@ -368,9 +411,18 @@ class Server:
   def __init__(self, ser, host='127.0.0.1', port=0, verbose=False):
     self.verbose = verbose
     self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # No SO_REUSEADDR: binding the deterministic port must fail loudly when
-    # somebody else already holds it, otherwise two brokers would claim the
-    # same address and clients would reach an arbitrary one.
+    # 決定論的ポートは「直前のブローカが去った直後に再び掴めること」と「稼働中の
+    # ブローカからは絶対に奪えないこと」の両方が要る。この2つを意味するオプション
+    # はOSで違い、WindowsのSO_REUSEADDRは稼働中の横取りを許してしまうため
+    # SO_EXCLUSIVEADDRUSEが正しい。POSIXのSO_REUSEADDRはTIME_WAITを緩めるだけで
+    # 稼働中のlistenerは奪えない
+    if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+      try:
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+      except OSError:
+        pass
+    else:
+      self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     self.sock.bind((host, port))
     self.sock.listen(8)
     self.sock.settimeout(0.5)
@@ -431,12 +483,13 @@ class Server:
 
   def shutdown(self):
     self.stop.set()
-    if self.broker is not None:
-      self.broker.shutdown()
+    # 先にlistenを畳む。acceptのtimeoutを待たずに新規接続を止められる
     try:
       self.sock.close()
     except OSError:
       pass
+    if self.broker is not None:
+      self.broker.shutdown()
 
 
 def serve(ser, listen_port, host='127.0.0.1', verbose=False):
