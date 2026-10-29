@@ -129,8 +129,8 @@ class Serial(SerialBase):
       return True
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
-      # owner_of() ではなく is_local()。前者は他プロセスを探しにソケットを
-      # 叩くので、待ちの中で回すと probe のタイムアウトぶん余計に待たされる
+      # Use is_local() instead of owner_of(). The latter queries a socket to
+      # look for other processes, causing extra delay from probe timeouts if polled in a loop.
       if not manager.is_local(device):
         return True
       time.sleep(0.005)
@@ -194,8 +194,8 @@ class Serial(SerialBase):
       self._fail('device removed: %s' % msg.get('msg', ''))
       return
     elif ev == 'device_reset':
-      # ブローカがハンドルを取り直しただけ。セッションは続いているので
-      # read() を例外で起こさない。取りこぼしはあり得るので手元は捨てる
+      # The broker just reacquired the handle. The session is continuing,
+      # so do not wake read() with an exception. Data loss is possible, so discard local data.
       self._lost = False
       with self._cv:
         del self._rx[:]

@@ -14,7 +14,9 @@ notifications in through notify_change() (wire it to DeviceChangeFilter), and
 otherwise a short-lived cache keeps the polling cost down.
 """
 
+import fnmatch
 import re
+import sys
 import threading
 import time
 
@@ -163,6 +165,176 @@ def comports():
     p.device = 'mux://%s' % normalize(p.device)
     out.append(p)
   return out
+
+
+def _natural_key(name):
+  """COM2 before COM10."""
+  return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', str(name))]
+
+
+def _win_bus_labels():
+  """{'COM33': 'RA4M2 Console', ...} straight from SetupAPI.
+
+  pyserial's description is the friendly name the driver builds ("USB Serial
+  Device (COM33)"), identical for every CDC port. What the device says about
+  itself (the interface string of a composite device, else the product string)
+  is only exposed as DEVPKEY_Device_BusReportedDeviceDesc, which Device Manager
+  shows as "Bus reported device description". Same classes as pyserial walks.
+  """
+  import ctypes
+  from ctypes import wintypes
+
+  setupapi = ctypes.WinDLL('setupapi', use_last_error=True)
+  advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
+
+  class GUID(ctypes.Structure):
+    _fields_ = [('Data1', wintypes.DWORD), ('Data2', wintypes.WORD), ('Data3', wintypes.WORD),
+                ('Data4', ctypes.c_ubyte * 8)]
+
+  def guid(text):
+    h = text.replace('-', '')
+    g = GUID()
+    g.Data1, g.Data2, g.Data3 = int(h[0:8], 16), int(h[8:12], 16), int(h[12:16], 16)
+    for i in range(8):
+      g.Data4[i] = int(h[16 + 2 * i:18 + 2 * i], 16)
+    return g
+
+  class SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [('cbSize', wintypes.DWORD), ('ClassGuid', GUID), ('DevInst', wintypes.DWORD),
+                ('Reserved', ctypes.c_void_p)]
+
+  class DEVPROPKEY(ctypes.Structure):
+    _fields_ = [('fmtid', GUID), ('pid', wintypes.ULONG)]
+
+  HDEVINFO = ctypes.c_void_p
+  HKEY = ctypes.c_void_p
+  INVALID_HANDLE = ctypes.c_void_p(-1).value
+  DIGCF_PRESENT = 0x00000002
+  DICS_FLAG_GLOBAL = 0x00000001
+  DIREG_DEV = 0x00000001
+  KEY_READ = 0x00020019
+  DEVPROP_TYPE_STRING = 0x00000012
+
+  get_class_devs = setupapi.SetupDiGetClassDevsW
+  get_class_devs.argtypes = [ctypes.POINTER(GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
+  get_class_devs.restype = HDEVINFO
+  enum_device_info = setupapi.SetupDiEnumDeviceInfo
+  enum_device_info.argtypes = [HDEVINFO, wintypes.DWORD, ctypes.POINTER(SP_DEVINFO_DATA)]
+  enum_device_info.restype = wintypes.BOOL
+  open_dev_reg_key = setupapi.SetupDiOpenDevRegKey
+  open_dev_reg_key.argtypes = [HDEVINFO, ctypes.POINTER(SP_DEVINFO_DATA), wintypes.DWORD, wintypes.DWORD,
+                               wintypes.DWORD, wintypes.DWORD]
+  open_dev_reg_key.restype = HKEY
+  get_device_property = setupapi.SetupDiGetDevicePropertyW
+  get_device_property.argtypes = [HDEVINFO, ctypes.POINTER(SP_DEVINFO_DATA), ctypes.POINTER(DEVPROPKEY),
+                                  ctypes.POINTER(wintypes.ULONG), ctypes.c_void_p, wintypes.DWORD,
+                                  ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+  get_device_property.restype = wintypes.BOOL
+  destroy_list = setupapi.SetupDiDestroyDeviceInfoList
+  destroy_list.argtypes = [HDEVINFO]
+  destroy_list.restype = wintypes.BOOL
+  reg_query_value = advapi32.RegQueryValueExW
+  reg_query_value.argtypes = [HKEY, wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                              ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+  reg_query_value.restype = wintypes.LONG
+  reg_close = advapi32.RegCloseKey
+  reg_close.argtypes = [HKEY]
+  reg_close.restype = wintypes.LONG
+
+  # DEVPKEY_Device_BusReportedDeviceDesc
+  bus_desc_key = DEVPROPKEY(guid('540b947e-8b40-45bc-a8a2-6a0b894cbda2'), 4)
+
+  def port_name(hdev, info):
+    key = open_dev_reg_key(hdev, ctypes.byref(info), DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ)
+    if not key or key == INVALID_HANDLE:
+      return ''
+    try:
+      buf = ctypes.create_unicode_buffer(256)
+      size = wintypes.DWORD(ctypes.sizeof(buf))
+      if reg_query_value(key, 'PortName', None, None, buf, ctypes.byref(size)) != 0:
+        return ''
+      return buf.value
+    finally:
+      reg_close(key)
+
+  def bus_desc(hdev, info):
+    buf = ctypes.create_unicode_buffer(512)
+    ptype = wintypes.ULONG(0)
+    need = wintypes.DWORD(0)
+    ok = get_device_property(hdev, ctypes.byref(info), ctypes.byref(bus_desc_key), ctypes.byref(ptype),
+                             buf, ctypes.sizeof(buf), ctypes.byref(need), 0)
+    if not ok or ptype.value != DEVPROP_TYPE_STRING:
+      return ''
+    return buf.value.strip()
+
+  out = {}
+  # Ports (COM & LPT) and Modem (some CDC drivers install there)
+  for class_guid in ('4d36e978-e325-11ce-bfc1-08002be10318', '4d36e96d-e325-11ce-bfc1-08002be10318'):
+    g = guid(class_guid)
+    hdev = get_class_devs(ctypes.byref(g), None, None, DIGCF_PRESENT)
+    if not hdev or hdev == INVALID_HANDLE:
+      continue
+    try:
+      index = 0
+      while True:
+        info = SP_DEVINFO_DATA()
+        info.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+        if not enum_device_info(hdev, index, ctypes.byref(info)):
+          break
+        index += 1
+        name = port_name(hdev, info)
+        if not name or name.upper().startswith('LPT'):
+          continue
+        label = bus_desc(hdev, info)
+        if label:
+          out[normalize(name)] = label
+    finally:
+      destroy_list(hdev)
+  return out
+
+
+def labels():
+  """Port name -> the name the USB device reports for that port.
+
+  Windows: "Bus reported device description" (see _win_bus_labels).
+  Linux: the USB interface string, else the product string (pyserial reads
+  both from sysfs). Ports that report nothing are left out, and so is every
+  port when enumeration fails: an empty dict only means nothing is known.
+  """
+  try:
+    if sys.platform == 'win32':
+      with _enum_lock:
+        return _win_bus_labels()
+    out = {}
+    for p in raw_comports():
+      name = (getattr(p, 'interface', None) or getattr(p, 'product', None) or '').strip()
+      if name:
+        out[normalize(p.device)] = name
+    return out
+  except Exception:
+    return {}
+
+
+def find_by_label(pattern, prefer=None, table=None):
+  """The port whose label matches pattern, or None.
+
+  Case-insensitive, surrounding spaces ignored, * and ? as in fnmatch.
+  When several match, `prefer` wins if it is one of them (keeps a runner on
+  the board it already has), otherwise the lowest port number.
+  `table` is a labels() result to reuse instead of enumerating again.
+  """
+  want = str(pattern or '').strip().casefold()
+  if not want:
+    return None
+  if table is None:
+    table = labels()
+  hits = sorted((name for name, label in table.items() if fnmatch.fnmatchcase(label.strip().casefold(), want)),
+                key=_natural_key)
+  if not hits:
+    return None
+  if prefer and normalize(prefer) in hits:
+    return normalize(prefer)
+  return hits[0]
 
 
 def wait_present(device, timeout=15.0, settle=0.3, poll=0.05):

@@ -34,10 +34,11 @@ _instances = {}             # device -> _Instance
 _closing = {}               # device -> _Instance, handle not yet given back
 _reaper = None
 _verbose = False
-# 2026-09-07: 解放要求があったことを刈り取りスレッドに即座に伝える。
-# 素のsleep(0.5)だと、refsが0になってから実際に物理ポートを手放すまで最悪
-# 0.5秒+lingerかかる。外部ツールに明け渡すような、物理的に排他でなければ
-# ならない場面ではこの遅れがそのまま失敗になる
+# 2026-09-07: Immediately notify the reaper thread when a release is requested.
+# With plain sleep(0.5), it takes up to 0.5s + linger after refs reaches 0
+# until the physical port is actually released. In situations where physical
+# exclusivity is required (e.g., handing over to an external tool), this delay
+# directly causes a failure.
 _wake = threading.Event()
 
 
@@ -92,8 +93,9 @@ def _listen(device, bind):
     return Server(None, host=bind[0], port=bind[1], verbose=_verbose)
 
   want = registry.default_port(device)
-  # 直前に同じポートを使っていたブローカの後始末と僅かに重なることがある。
-  # ここでエフェメラルに落ちると他プロセスから見つけられなくなるので、少し粘る
+  # May slightly overlap with the cleanup of a broker that used the same port
+  # just before. Falling back to an ephemeral port here prevents other processes
+  # from finding us, so retry briefly.
   last = None
   for attempt in range(6):
     try:
@@ -127,7 +129,7 @@ def ensure(device, bind=None, **kw):
 
   device = _key(device)
 
-  # 解放処理の途中なら、終わるまで待ってから判断する
+  # If in the middle of closing, wait until it finishes before deciding.
   deadline = time.monotonic() + 2.0
   while time.monotonic() < deadline:
     with _lock:
@@ -319,11 +321,12 @@ def _check_presence(force=False):
           inst.lost = True
         continue
 
-      # 2026-09-07: 名前が同じでも中身が入れ替わっていることがある。
-      # ネイティブUSBのボードは書き込み後のリセットで一度USBから消えて生え直し、
-      # Windowsは同じCOM番号を割り当て直す。消えて戻るまでがLOST_GRACEより短いと
-      # 「ずっと居た」ように見えてしまい、古いインスタンスへのハンドルを握った
-      # まま素通しする -- openは通るのに何も流れてこない、あの状態になる
+      # 2026-09-07: The hardware device may have been swapped even if the name is identical.
+      # Native USB boards disappear from USB and re-appear upon reset after flashing,
+      # and Windows re-assigns the same COM number. If disappearance and return is shorter
+      # than LOST_GRACE, it appears as if it was "always present", letting requests pass through
+      # while holding a handle to the stale instance -- leading to the state where open succeeds
+      # but nothing flows through.
       now_ident = presence.identity(device)
       if now_ident is not None and inst.ident is not None \
          and now_ident != inst.ident:
@@ -332,7 +335,7 @@ def _check_presence(force=False):
         if inst.server.client_count() > 0:
           inst.server.broker.recycle()
         else:
-          # 誰も居ないなら握り直す必要すらない。次のopenが綺麗に始める
+          # If nobody is attached, there is no need to re-acquire. The next open starts clean.
           inst.linger = 0.0
           _wake.set()
       elif inst.ident is None:
@@ -374,9 +377,9 @@ def _reap_once():
     dead = []
     for d in list(_instances):
       if _instances[d].reapable(now):
-        # 2026-09-07: _instancesから外した瞬間に「解放済み」と見えてしまうと、
-        # 実際にはまだ物理ハンドルを握っている間に呼び出し元が次の処置へ進む。
-        # shutdownが終わるまでは_closingに居させ、is_local()からは見えるままに
+        # 2026-09-07: If marked as "released" immediately upon removing from _instances,
+        # the caller might proceed to the next step while the physical handle is still held.
+        # Keep it in _closing until shutdown completes so it remains visible to is_local().
         dead.append((d, _instances.pop(d)))
         _closing[d] = dead[-1][1]
     empty = not _instances
@@ -401,9 +404,9 @@ def _start_reaper():
   def loop():
     busy = 0
     while True:
-      # 解放要求で即座に起きる。ただしrelease()の時点ではブローカ側がまだ
-      # ソケットのEOFを処理しておらずclient_count()が減っていないことがあるので、
-      # 起こされた直後はしばらく細かい間隔で見張る
+      # Wake up immediately on release request. However, at the time release() is called,
+      # the broker side might not have processed the socket EOF yet and client_count()
+      # may not have decreased, so monitor at a fine interval for a while after being woken up.
       interval = POLL_BUSY if busy > 0 else POLL_IDLE
       if _wake.wait(interval):
         _wake.clear()
@@ -416,7 +419,7 @@ def _start_reaper():
         with _lock:
           # Nothing physical to track: do not enumerate at all.
           need = any(not presence.is_virtual(d) for d in _instances)
-        # 列挙は重いので、細かく回っている間は毎周やらない
+        # Enumeration is heavy, so do not perform it every cycle while looping frequently.
         if need and (busy == 0 or dirty):
           _check_presence(force=dirty)
       except Exception:

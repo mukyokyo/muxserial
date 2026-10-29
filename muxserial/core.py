@@ -54,10 +54,10 @@ class _Client:
     self.reader = FrameReader()
     self.wlock = threading.Lock()
     self.alive = True
-    # 2026-09-03: [Tester] このクライアントが最後に要求した設定(baudrate等)。
-    # 物理ポートは1つしか無いので他クライアントの都合で値が変わり得るが、この
-    # クライアント自身の「これで喋るはず」という認識はここに握ったまま譲らない。
-    # Broker.handle_data()が書き込み直前に物理ポート側をこれへ追従させる
+    # 2026-09-03: [Tester] The latest settings requested by this client (baudrate, etc.).
+    # Since there is only one physical port, values may change due to other clients,
+    # but this client's perception of "how it should talk" is retained here.
+    # Broker.handle_data() makes the physical port follow this just before writing.
     self.settings = {}
 
   def send(self, frame):
@@ -88,6 +88,11 @@ class Broker:
     self.clients = []
     self.lock = threading.RLock()
     self.cv = threading.Condition(self.lock)
+    # Serialize only writes to the physical port and accompanying setting changes.
+    # Keep separate from self.lock because writes do not return until the device receives them
+    # (enclosing writes with self.lock stops _pump and broadcast, causing deadlocks with echoing devices).
+    # Acquisition order is txlock -> lock; never acquire txlock while holding lock.
+    self.txlock = threading.Lock()
     self.lease_owner = None
     self.lease_rx = 'tee'
     self.detached = False
@@ -124,16 +129,16 @@ class Broker:
       with self.lock:
         idle = self.detached or self.lost
       if idle:
-        # stopで即座に抜けられるよう、素のsleepでは待たない
+        # Avoid bare sleep so it can exit immediately on stop
         self.stop.wait(0.02)
         continue
       try:
-        # 2026-09-03: [Tester] ここは意図的にロックしない。実測したところ、この
-        # 読み取りループを毎周self.lockで囲むと、無データ時でもtimeout=0.05分
-        # ロックを持ち続けては即座に再取得を繰り返すため、handle_data/handle_ctrl
-        # 側が長時間ロックを取れなくなる(再取得の方が有利になりがちな飢餓状態)。
-        # read()とreconfigure(setattr)が理論上ごく短時間だけ重なる余地は残るが、
-        # 元々あった隙であり、書き込みの方を確実に直列化することの方が重要
+        # 2026-09-03: [Tester] Intentionally unlocked here. Benchmarks showed that
+        # enclosing this read loop in self.lock on every iteration causes it to hold
+        # the lock for timeout=0.05 even when idle, then immediately re-acquire it.
+        # This starves handle_data/handle_ctrl from acquiring the lock for long periods.
+        # While read() and reconfigure(setattr) could theoretically overlap briefly,
+        # that window existed anyway, and serializing writes is far more critical.
         data = self.ser.read(1)
         if data and self.ser.in_waiting:
           data += self.ser.read(self.ser.in_waiting)
@@ -258,10 +263,10 @@ class Broker:
       self.cv.notify_all()
     for c in clients:
       c.close()
-    # 2026-09-07: 物理ハンドルを閉じる前に_pumpを抜けさせる。read()の最中に別
-    # スレッドからclose()すると、Windowsでは保留中のI/Oを巻き込んで解放が遅れる
-    # (最悪ハンドルが残って次のopenが弾かれる)。read()のtimeoutは0.05なので、
-    # ここでの待ちは実質1周分にしかならない
+    # 2026-09-07: Let _pump exit before closing the physical handle. Closing from another
+    # thread during read() causes delayed release on Windows due to pending I/O
+    # (in the worst case, the handle remains and blocks the next open). Since read() timeout is 0.05,
+    # waiting here practically lasts for only one iteration.
     for t in self._threads:
       if t is not threading.current_thread():
         t.join(join_timeout)
@@ -277,11 +282,11 @@ class Broker:
     op = msg.get('op')
 
     if op == 'config':
-      # 2026-09-03: [Tester] 即座に物理ポートへ反映するのはこれまで通り(まだ一度も
-      # 書いていないクライアントの読み取りもこれでカバーされる)。加えて、cが次に
-      # 書き込む時にも同じ内容を再主張できるよう、c.settingsに覚えておく。他の
-      # クライアントが間で勝手に設定を変えても、cにとっての「正しい設定」はこれ
-      with self.lock:
+      # 2026-09-03: [Tester] Apply immediately to the physical port as before (covering
+      # reads for clients that haven't written yet). Additionally, store in c.settings
+      # so c can re-assert its settings before its next write. Even if another client
+      # changes settings in between, this remains the "correct settings" for c.
+      with self.txlock, self.lock:
         if self._blocked(c):
           return
         for k in ('baudrate', 'bytesize', 'parity', 'stopbits',
@@ -319,6 +324,7 @@ class Broker:
               return
           self.lease_owner = c
           self.lease_rx = msg.get('rx', 'tee')
+        self._drain_tx()
         try:
           self.ser.reset_input_buffer()
         except Exception:
@@ -338,6 +344,7 @@ class Broker:
           return
         name = self.ser.port
         self.detached = True
+      self._drain_tx()
       time.sleep(0.05)
       try:
         self.ser.close()
@@ -360,6 +367,11 @@ class Broker:
       self.broadcast(pack_event('resumed', error=err), only=list(self.clients))
       self.log('reattached', err or 'ok')
 
+  def _drain_tx(self):
+    """Wait if another client's write is in progress (before acquiring or releasing lease)"""
+    with self.txlock:
+      pass
+
   def _blocked(self, c):
     return self.lease_owner is not None and self.lease_owner is not c
 
@@ -376,10 +388,10 @@ class Broker:
       return True
 
   def _sync_client_config(self, c):
-    """[Tester] 物理ポートをcの最後の希望設定に追従させる。値が既に一致している
-    項目は触らない(毎回無条件のsetattrはしない)。呼び出し元でself.lockを保持
-    している前提。ブートローダ→アプリでボーレートが飛ぶような使い方でも、書き
-    込み元のクライアントが自分の値を主張し続ければ物理層もそこに追従する"""
+    """[Tester] Synchronize physical port to c's latest desired settings.
+    Do not touch properties whose values already match (avoid unconditional setattr each time).
+    Assumes caller holds self.lock. Even in use cases where baud rate changes, like
+    bootloader -> app, as long as the writing client asserts its settings, the physical layer follows."""
     for k, v in c.settings.items():
       try:
         if getattr(self.ser, k) != v:
@@ -395,11 +407,13 @@ class Broker:
       c.send(pack_event('error', msg='write blocked by lease'))
       return
     try:
-      # 2026-09-03: [Tester] 「今まさに書き込もうとする時に想定と違えば設定変え
-      # てから処置する」。再設定と書き込みを同じロックの中で行い、他クライアント
-      # の書き込み/再設定/_pumpの読み取りが割り込まないようにする
-      with self.lock:
-        self._sync_client_config(c)
+      # Align physical port with c's settings right before writing.
+      # Use txlock to prevent interleaved writes/reconfigurations from other clients, holding self.lock only during alignment.
+      # Since _pump continues reading during writes, receiving will not stall if device TX is blocked.
+      # If unplugged, mark_lost closes the handle and aborts pending writes.
+      with self.txlock:
+        with self.lock:
+          self._sync_client_config(c)
         self.ser.write(data)
     except Exception as e:
       c.send(pack_event('error', msg=str(e)))
@@ -411,11 +425,10 @@ class Server:
   def __init__(self, ser, host='127.0.0.1', port=0, verbose=False):
     self.verbose = verbose
     self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # 決定論的ポートは「直前のブローカが去った直後に再び掴めること」と「稼働中の
-    # ブローカからは絶対に奪えないこと」の両方が要る。この2つを意味するオプション
-    # はOSで違い、WindowsのSO_REUSEADDRは稼働中の横取りを許してしまうため
-    # SO_EXCLUSIVEADDRUSEが正しい。POSIXのSO_REUSEADDRはTIME_WAITを緩めるだけで
-    # 稼働中のlistenerは奪えない
+    # Deterministic ports require both "can be re-bound immediately after the previous broker leaves"
+    # and "can never be hijacked from a running broker". Options providing these behaviors differ by OS:
+    # on Windows, SO_REUSEADDR allows hijacking active sockets, so SO_EXCLUSIVEADDRUSE is correct.
+    # On POSIX, SO_REUSEADDR merely relaxes TIME_WAIT without allowing hijacking active listeners.
     if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
       try:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
@@ -483,7 +496,7 @@ class Server:
 
   def shutdown(self):
     self.stop.set()
-    # 先にlistenを畳む。acceptのtimeoutを待たずに新規接続を止められる
+    # Close listen socket first to stop new connections without waiting for accept timeout
     try:
       self.sock.close()
     except OSError:
